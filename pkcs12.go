@@ -138,8 +138,8 @@ func unmarshal(in []byte, out interface{}) error {
 //
 // Deprecated: ToPEM creates invalid PEM blocks (private keys
 // are encoded as raw RSA or EC private keys rather than PKCS#8 despite being
-// labeled "PRIVATE KEY").  To decode a PKCS#12 file, use DecodeChain instead,
-// and use the encoding/pem package to convert to PEM if necessary.
+// labeled "PRIVATE KEY").  To decode a PKCS#12 file, use [DecodeChain] instead,
+// and use the [encoding/pem] package to convert to PEM if necessary.
 func ToPEM(pfxData []byte, password string) ([]*pem.Block, error) {
 	encodedPassword, err := bmpStringZeroTerminated(password)
 	if err != nil {
@@ -248,7 +248,7 @@ func convertAttribute(attribute *pkcs12Attribute) (key, value string, err error)
 // Decode extracts a certificate and private key from pfxData, which must be a DER-encoded PKCS#12 file. This function
 // assumes that there is only one certificate and only one private key in the
 // pfxData.  Since PKCS#12 files often contain more than one certificate, you
-// probably want to use DecodeChain instead.
+// probably want to use [DecodeChain] instead.
 func Decode(pfxData []byte, password string) (privateKey interface{}, certificate *x509.Certificate, err error) {
 	var caCerts []*x509.Certificate
 	privateKey, certificate, caCerts, err = DecodeChain(pfxData, password)
@@ -381,10 +381,10 @@ func getSafeContents(p12Data, password []byte, expectedItems int) (bags []safeBa
 	}
 
 	if len(pfx.MacData.Mac.Algorithm.Algorithm) == 0 {
-		return nil, nil, errors.New("pkcs12: no MAC in data")
-	}
-
-	if err := verifyMac(&pfx.MacData, pfx.AuthSafe.Content.Bytes, password); err != nil {
+		if !(len(password) == 2 && password[0] == 0 && password[1] == 0) {
+			return nil, nil, errors.New("pkcs12: no MAC in data")
+		}
+	} else if err := verifyMac(&pfx.MacData, pfx.AuthSafe.Content.Bytes, password); err != nil {
 		if err == ErrIncorrectPassword && len(password) == 2 && password[0] == 0 && password[1] == 0 {
 			// some implementations use an empty byte array
 			// for the empty string password try one more
@@ -445,11 +445,11 @@ func getSafeContents(p12Data, password []byte, expectedItems int) (bags []safeBa
 //
 // The private key is encrypted with the provided password, but due to the
 // weak encryption primitives used by PKCS#12, it is RECOMMENDED that you
-// specify a hard-coded password (such as pkcs12.DefaultPassword) and protect
+// specify a hard-coded password (such as [DefaultPassword]) and protect
 // the resulting pfxData using other means.
 //
 // The rand argument is used to provide entropy for the encryption, and
-// can be set to rand.Reader from the crypto/rand package.
+// can be set to [crypto/rand.Reader].
 //
 // Encode emulates the behavior of OpenSSL's PKCS12_create: it creates two
 // SafeContents: one that's encrypted with RC2 and contains the certificates,
@@ -546,15 +546,67 @@ func Encode(rand io.Reader, privateKey interface{}, certificate *x509.Certificat
 // allow it to be used as a Java TrustStore in Java 1.8 and newer.
 //
 // Due to the weak encryption primitives used by PKCS#12, it is RECOMMENDED that
-// you specify a hard-coded password (such as pkcs12.DefaultPassword) and protect
+// you specify a hard-coded password (such as [DefaultPassword]) and protect
 // the resulting pfxData using other means.
 //
 // The rand argument is used to provide entropy for the encryption, and
-// can be set to rand.Reader from the crypto/rand package.
+// can be set to [crypto/rand.Reader].
 //
 // EncodeTrustStore creates a single SafeContents that's encrypted with RC2
 // and contains the certificates.
+//
+// The Subject of the certificates are used as the Friendly Names (Aliases)
+// within the resulting pfxData. If certificates share a Subject, then the
+// resulting Friendly Names (Aliases) will be identical, which Java may treat as
+// the same entry when used as a Java TrustStore, e.g. with `keytool`.  To
+// customize the Friendly Names, use [EncodeTrustStoreEntries].
 func EncodeTrustStore(rand io.Reader, certs []*x509.Certificate, password string) (pfxData []byte, err error) {
+	var certsWithFriendlyNames []TrustStoreEntry
+	for _, cert := range certs {
+		certsWithFriendlyNames = append(certsWithFriendlyNames, TrustStoreEntry{
+			Cert:         cert,
+			FriendlyName: cert.Subject.String(),
+		})
+	}
+	return EncodeTrustStoreEntries(rand, certsWithFriendlyNames, password)
+}
+
+// TrustStoreEntry represents an entry in a Java TrustStore.
+type TrustStoreEntry struct {
+	Cert         *x509.Certificate
+	FriendlyName string
+}
+
+// KeyStoreEntry represents an entry in a Java KeyStore.
+type KeyStoreEntry struct {
+	Cert         *x509.Certificate
+	PrivateKey   interface{}
+	CACerts      []*x509.Certificate
+	FriendlyName string
+}
+
+// EncodeTrustStoreEntries produces pfxData containing any number of CA
+// certificates (entries) to be trusted. The certificates will be marked with a
+// special OID that allow it to be used as a Java TrustStore in Java 1.8 and newer.
+//
+// This is identical to [EncodeTrustStore], but also allows for setting specific
+// Friendly Names (Aliases) to be used per certificate, by specifying a slice
+// of TrustStoreEntry.
+//
+// If the same Friendly Name is used for more than one certificate, then the
+// resulting Friendly Names (Aliases) in the pfxData will be identical, which Java
+// may treat as the same entry when used as a Java TrustStore, e.g. with `keytool`.
+//
+// Due to the weak encryption primitives used by PKCS#12, it is RECOMMENDED that
+// you specify a hard-coded password (such as [DefaultPassword]) and protect
+// the resulting pfxData using other means.
+//
+// The rand argument is used to provide entropy for the encryption, and
+// can be set to [crypto/rand.Reader].
+//
+// EncodeTrustStoreEntries creates a single SafeContents that's encrypted
+// with RC2 and contains the certificates.
+func EncodeTrustStoreEntries(rand io.Reader, entries []TrustStoreEntry, password string) (pfxData []byte, err error) {
 	encodedPassword, err := bmpStringZeroTerminated(password)
 	if err != nil {
 		return nil, err
@@ -583,9 +635,9 @@ func EncodeTrustStore(rand io.Reader, certs []*x509.Certificate, password string
 	})
 
 	var certBags []safeBag
-	for _, cert := range certs {
+	for _, entry := range entries {
 
-		bmpFriendlyName, err := bmpString(cert.Subject.String())
+		bmpFriendlyName, err := bmpString(entry.FriendlyName)
 		if err != nil {
 			return nil, err
 		}
@@ -610,7 +662,7 @@ func EncodeTrustStore(rand io.Reader, certs []*x509.Certificate, password string
 			},
 		}
 
-		certBag, err := makeCertBag(cert.Raw, append(certAttributes, friendlyName))
+		certBag, err := makeCertBag(entry.Cert.Raw, append(certAttributes, friendlyName))
 		if err != nil {
 			return nil, err
 		}
@@ -654,6 +706,133 @@ func EncodeTrustStore(rand io.Reader, certs []*x509.Certificate, password string
 	return
 }
 
+// EncodeKeyStoreEntries produces pfxData containing any number of KeyStoreEntries.
+// It allows for setting specific Friendly Names (Aliases) to be used per privateKey&certificate pair,
+// by specifying a slice of KeyStoreEntry.
+//
+// If the same Friendly Name is used for more than one privateKey&certificate pair, then the
+// resulting Friendly Names (Aliases) in the pfxData will be identical, which Java
+// may treat as the same entry when used as a Java KeyStore, e.g. with `keytool`.
+//
+// Due to the weak encryption primitives used by PKCS#12, it is RECOMMENDED that
+// you specify a hard-coded password (such as [DefaultPassword]) and protect
+// the resulting pfxData using other means.
+//
+// The rand argument is used to provide entropy for the encryption, and
+// can be set to [crypto/rand.Reader].
+func EncodeKeyStoreEntries(rand io.Reader, entries []KeyStoreEntry, password string) (pfxData []byte, err error) {
+	encodedPassword, err := bmpStringZeroTerminated(password)
+	if err != nil {
+		return nil, err
+	}
+
+	var pfx pfxPdu
+	pfx.Version = 3
+
+	var certBags []safeBag
+	var keyBags []safeBag
+	for _, entry := range entries {
+
+		var certFingerprint = sha1.Sum(entry.Cert.Raw)
+		var localKeyIdAttr pkcs12Attribute
+		localKeyIdAttr.Id = oidLocalKeyID
+		localKeyIdAttr.Value.Class = 0
+		localKeyIdAttr.Value.Tag = 17
+		localKeyIdAttr.Value.IsCompound = true
+		if localKeyIdAttr.Value.Bytes, err = asn1.Marshal(certFingerprint[:]); err != nil {
+			return nil, err
+		}
+
+		var certAttributes []pkcs12Attribute
+		certAttributes = append(certAttributes, localKeyIdAttr)
+
+		bmpFriendlyName, err := bmpString(entry.FriendlyName)
+		if err != nil {
+			return nil, err
+		}
+
+		encodedFriendlyName, err := asn1.Marshal(asn1.RawValue{
+			Class:      0,
+			Tag:        30,
+			IsCompound: false,
+			Bytes:      bmpFriendlyName,
+		})
+		if err != nil {
+			return nil, err
+		}
+
+		friendlyNameAttr := pkcs12Attribute{
+			Id: oidFriendlyName,
+			Value: asn1.RawValue{
+				Class:      0,
+				Tag:        17,
+				IsCompound: true,
+				Bytes:      encodedFriendlyName,
+			},
+		}
+
+		certBag, err := makeCertBag(entry.Cert.Raw, append(certAttributes, friendlyNameAttr))
+		if err != nil {
+			return nil, err
+		}
+		certBags = append(certBags, *certBag)
+		for _, cert := range entry.CACerts {
+			if certBag, err = makeCertBag(cert.Raw, []pkcs12Attribute{}); err != nil {
+				return nil, err
+			}
+			certBags = append(certBags, *certBag)
+		}
+
+		keyBag, err := makeKeyBag(rand, entry.PrivateKey, encodedPassword)
+		if err != nil {
+			return nil, err
+		}
+		keyBag.Attributes = append(keyBag.Attributes, localKeyIdAttr)
+		keyBag.Attributes = append(keyBag.Attributes, friendlyNameAttr)
+		keyBags = append(keyBags, *keyBag)
+	}
+
+	// Construct an authenticated safe with two SafeContents.
+	// The first SafeContents is encrypted and contains the cert bags.
+	// The second SafeContents is unencrypted and contains the shrouded key bag.
+	var authenticatedSafe [2]contentInfo
+	if authenticatedSafe[0], err = makeSafeContents(rand, certBags, encodedPassword); err != nil {
+		return nil, err
+	}
+	if authenticatedSafe[1], err = makeSafeContents(rand, keyBags, nil); err != nil {
+		return nil, err
+	}
+
+	var authenticatedSafeBytes []byte
+	if authenticatedSafeBytes, err = asn1.Marshal(authenticatedSafe[:]); err != nil {
+		return nil, err
+	}
+
+	// compute the MAC
+	pfx.MacData.Mac.Algorithm.Algorithm = oidSHA1
+	pfx.MacData.MacSalt = make([]byte, 8)
+	if _, err = rand.Read(pfx.MacData.MacSalt); err != nil {
+		return nil, err
+	}
+	pfx.MacData.Iterations = 1
+	if err = computeMac(&pfx.MacData, authenticatedSafeBytes, encodedPassword); err != nil {
+		return nil, err
+	}
+
+	pfx.AuthSafe.ContentType = oidDataContentType
+	pfx.AuthSafe.Content.Class = 2
+	pfx.AuthSafe.Content.Tag = 0
+	pfx.AuthSafe.Content.IsCompound = true
+	if pfx.AuthSafe.Content.Bytes, err = asn1.Marshal(authenticatedSafeBytes); err != nil {
+		return nil, err
+	}
+
+	if pfxData, err = asn1.Marshal(pfx); err != nil {
+		return nil, errors.New("pkcs12: error writing P12 data: " + err.Error())
+	}
+	return
+}
+
 func makeCertBag(certBytes []byte, attributes []pkcs12Attribute) (certBag *safeBag, err error) {
 	certBag = new(safeBag)
 	certBag.Id = oidCertBag
@@ -664,6 +843,18 @@ func makeCertBag(certBytes []byte, attributes []pkcs12Attribute) (certBag *safeB
 		return nil, err
 	}
 	certBag.Attributes = attributes
+	return
+}
+
+func makeKeyBag(rand io.Reader, privateKey interface{}, encodedPassword []byte) (keyBag *safeBag, err error) {
+	keyBag = new(safeBag)
+	keyBag.Id = oidPKCS8ShroundedKeyBag
+	keyBag.Value.Class = 2
+	keyBag.Value.Tag = 0
+	keyBag.Value.IsCompound = true
+	if keyBag.Value.Bytes, err = encodePkcs8ShroudedKeyBag(rand, privateKey, encodedPassword); err != nil {
+		return nil, err
+	}
 	return
 }
 
